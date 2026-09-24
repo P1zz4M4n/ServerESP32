@@ -1,7 +1,34 @@
 services:
-  app:
+  server:
     build: .
+
+    container_name: serveresp32
+
     ports:
       - "3000:3000"
-    env_files: .env
+
+    environment:
+      TZ: Europe/Rome
+      PORT: "3000"
+
+      DB_PATH: /data/dipendenti.db
+
+      NAS_BASE_PATH: /NAS/tabella presenze/Lettura NFC
+
+    volumes:
+
+      # Usa il database presente nel progetto.
+      # Non viene creato un database Docker separato.
+      - type: bind
+        source: ./dipendenti.db
+        target: /data/dipendenti.db
+        read_only: true
+
+      # NAS reale montato sull'host.
+      - type: bind
+        source: /mnt/NAS
+        target: /NAS
+        bind:
+          create_host_path: false
+
     restart: unless-stopped

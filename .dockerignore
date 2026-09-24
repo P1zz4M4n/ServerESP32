@@ -1,4 +1,9 @@
 node_modules
 .git
+.gitignore
 .env
+*.db
 npm-debug.log
+README.md
+Dockerfile
+docker-compose.yml
