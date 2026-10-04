@@ -1,0 +1,29 @@
+# Dipendenze Node.js
+node_modules/
+
+# File di configurazione locali / sensibili
+.env
+.env.*
+!.env.example
+
+# Database locale
+*.db
+*.sqlite
+*.sqlite3
+
+# File Excel generati
+*.xlsx
+
+# Log
+*.log
+logs/
+
+# File temporanei
+tmp/
+temp/
+
+# Sistema operativo / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
