@@ -20,7 +20,7 @@ services:
       # Usa il database presente nel progetto.
       # Non viene creato un database Docker separato.
       - type: bind
-        source: ./dipendenti.db
+        source: /opt/serveresp32/data/dipendenti.db
         target: /data/dipendenti.db
         read_only: true
 
