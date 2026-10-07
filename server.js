@@ -512,6 +512,40 @@ function rimuoviRigaTotali(worksheet) {
     }
 }
 
+// Elimina solo le righe vuote in coda (comprese le righe modello con
+// 00:00:00 nelle colonne dei totali). ExcelJS le considera righe usate:
+// lasciarle lì farebbe accodare le nuove giornate molto più in basso.
+function eRigaSegnaposto(row) {
+    const vuoto = value =>
+        value === null ||
+        value === undefined ||
+        value === '';
+
+    const nessunDatoPresenza = [1, 2, 3, 4, 5, 6, 7]
+        .every(colonna => vuoto(row.getCell(colonna).value));
+
+    const totaleVuotoOZero = value =>
+        vuoto(value) ||
+        value === 0 ||
+        value === '00:00:00';
+
+    return nessunDatoPresenza &&
+        totaleVuotoOZero(row.getCell(8).value) &&
+        totaleVuotoOZero(row.getCell(9).value);
+}
+
+function rimuoviSegnapostoFinali(worksheet) {
+    for (let rowNumber = worksheet.rowCount; rowNumber >= 2; rowNumber--) {
+        const row = worksheet.getRow(rowNumber);
+
+        if (!eRigaSegnaposto(row)) {
+            break;
+        }
+
+        worksheet.spliceRows(rowNumber, 1);
+    }
+}
+
 // ============================================================================
 // CALCOLO TOTALI MENSILI
 // ============================================================================
@@ -559,21 +593,19 @@ function aggiungiTotaliMensili(worksheet) {
     const totali =
         calcolaTotaliMensili(worksheet);
 
-    const rigaTotali = worksheet.addRow({
-        dipendente: 'TOTALI MENSILI',
-        uid: '',
-        data: '',
-        p1: '',
-        p2: '',
-        p3: '',
-        p4: '',
-        totale: secondsToTime(
-            totali.lavorato
-        ),
-        straordinari: secondsToTime(
-            totali.straordinari
-        )
-    });
+    // Array esplicito: le chiavi definite in worksheet.columns non sono
+    // conservate nel file XLSX e non sono disponibili dopo readFile().
+    const rigaTotali = worksheet.addRow([
+        'TOTALI MENSILI',
+        '',
+        '',
+        '',
+        '',
+        '',
+        '',
+        secondsToTime(totali.lavorato),
+        secondsToTime(totali.straordinari)
+    ]);
 
     rigaTotali.font = {
         bold: true
@@ -836,6 +868,9 @@ async function gestisciPresenze(
             worksheet
         );
 
+        // Rimuove i segnaposto finali prima di accodare i dati reali.
+        rimuoviSegnapostoFinali(worksheet);
+
         // ------------------------------------------------------------
         // CERCA LA RIGA DEL DIPENDENTE
         // NELLA GIORNATA CORRENTE
@@ -860,7 +895,7 @@ async function gestisciPresenze(
                 const rowUid =
                     String(
                         valoreUid || ''
-                    ).trim();
+                    ).trim().toUpperCase();
 
                 // Normalizzazione data.
                 //
@@ -914,35 +949,17 @@ async function gestisciPresenze(
                 '🆕 Nessuna riga per oggi: creazione nuova riga.'
             );
 
-            targetRow =
-                worksheet.addRow({
-                    dipendente:
-                        nomeDipendente,
-
-                    uid:
-                        uid,
-
-                    data:
-                        dataOggi,
-
-                    p1:
-                        oraTimbratura,
-
-                    p2:
-                        '',
-
-                    p3:
-                        '',
-
-                    p4:
-                        '',
-
-                    totale:
-                        '00:00:00',
-
-                    straordinari:
-                        '00:00:00'
-                });
+            targetRow = worksheet.addRow([
+                nomeDipendente,
+                uid,
+                dataOggi,
+                oraTimbratura,
+                '',
+                '',
+                '',
+                '00:00:00',
+                '00:00:00'
+            ]);
 
             console.log(
                 `➕ Nuova riga creata: ${targetRow.number}`
