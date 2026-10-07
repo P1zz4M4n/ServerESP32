@@ -485,30 +485,22 @@ function creaStrutturaWorksheet(worksheet) {
 // RIGA TOTALI MENSILI
 // ============================================================================
 
-function trovaRigaTotali(worksheet) {
+function rimuoviRigaTotali(worksheet) {
+    // Un file già affetto dal problema può contenere più righe totali.
+    // Rimuoverne una sola a ogni timbratura le farebbe accumulare nel tempo.
     for (
         let rowNumber = worksheet.rowCount;
         rowNumber >= 2;
         rowNumber--
     ) {
-        const row = worksheet.getRow(rowNumber);
+        const valore = worksheet.getRow(rowNumber).getCell(1).value;
 
         if (
-            row.getCell(1).value ===
-            'TOTALI MENSILI'
+            typeof valore === 'string' &&
+            valore.trim().toUpperCase() === 'TOTALI MENSILI'
         ) {
-            return rowNumber;
+            worksheet.spliceRows(rowNumber, 1);
         }
-    }
-
-    return null;
-}
-
-function rimuoviRigaTotali(worksheet) {
-    const rowNumber = trovaRigaTotali(worksheet);
-
-    if (rowNumber !== null) {
-        worksheet.spliceRows(rowNumber, 1);
     }
 }
 
