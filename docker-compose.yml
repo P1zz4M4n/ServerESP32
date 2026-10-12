@@ -13,7 +13,7 @@ services:
 
       DB_PATH: /data/dipendenti.db
 
-      NAS_BASE_PATH: /NAS/tabella presenze/Lettura NFC
+      NAS_BASE_PATH: /NAS/Cartella dipendenti/tabella presenze/Lettura NFC
 
     volumes:
 
