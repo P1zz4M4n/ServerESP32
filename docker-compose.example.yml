@@ -1,32 +1,27 @@
 services:
   server:
     build: .
-
     container_name: serveresp32
 
     ports:
-      - "3000:3000"
+      - "${HOST_PORT:-3000}:3000"
 
     environment:
-      TZ: Europe/Rome
+      TZ: "${TZ:-Europe/Rome}"
       PORT: "3000"
-
       DB_PATH: /data/dipendenti.db
-
-      NAS_BASE_PATH: /NAS/Cartella dipendenti/tabella presenze/Lettura NFC
+      NAS_BASE_PATH: "${NAS_BASE_PATH:-/NAS/Cartella dipendenti/tabella presenze/Lettura NFC}"
 
     volumes:
-
-      # Usa il database presente nel progetto.
-      # Non viene creato un database Docker separato.
+      # Database host montato in sola lettura.
       - type: bind
-        source: /opt/serveresp32/data/dipendenti.db
+        source: "${DB_FILE:-./data/dipendenti.db}"
         target: /data/dipendenti.db
         read_only: true
 
-      # NAS reale montato sull'host.
+      # NAS già montato sull'host.
       - type: bind
-        source: /mnt/NAS
+        source: "${NAS_MOUNT:-./NAS}"
         target: /NAS
         bind:
           create_host_path: false
