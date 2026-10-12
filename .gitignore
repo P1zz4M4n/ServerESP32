@@ -27,3 +27,6 @@ temp/
 Thumbs.db
 .vscode/
 .idea/
+
+# Configurazione specifica della macchina
+docker-compose.yml
