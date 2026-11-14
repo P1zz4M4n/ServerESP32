@@ -336,14 +336,42 @@ function normalizzaDataExcel(value) {
 // ============================================================================
 
 function timeToSeconds(timeStr) {
-    if (!timeStr) {
+    if (timeStr === null || timeStr === undefined || timeStr === '') {
         return 0;
+    }
+
+    // ExcelJS restituisce spesso le celle formattate come ora come Date,
+    // non come stringhe. I componenti UTC rappresentano l'ora memorizzata
+    // nel seriale Excel senza applicare il fuso orario del server.
+    if (timeStr instanceof Date) {
+        if (!Number.isFinite(timeStr.getTime())) {
+            return 0;
+        }
+
+        return timeStr.getUTCHours() * 3600 +
+            timeStr.getUTCMinutes() * 60 +
+            timeStr.getUTCSeconds();
+    }
+
+    // Supporta anche un valore numerico Excel che rappresenta una frazione
+    // di giornata (es. 0,5 = 12:00).
+    if (typeof timeStr === 'number') {
+        if (!Number.isFinite(timeStr) || timeStr < 0 || timeStr >= 1) {
+            return 0;
+        }
+
+        return Math.round(timeStr * 24 * 3600);
     }
 
     if (typeof timeStr !== 'string') {
         return 0;
     }
 
+    const valore = timeStr.trim();
+    if (!valore) {
+        return 0;
+    }
+    
     const parts = timeStr.split(':');
 
     if (parts.length < 2 || parts.length > 3) {
@@ -357,7 +385,10 @@ function timeToSeconds(timeStr) {
     if (
         !Number.isFinite(h) ||
         !Number.isFinite(m) ||
-        !Number.isFinite(s)
+        !Number.isFinite(s) ||
+        h < 0 ||
+        m < 0 || m > 59 ||
+        s < 0 || s > 59
     ) {
         return 0;
     }
@@ -582,6 +613,10 @@ function aggiungiTotaliMensili(worksheet) {
     // Prima rimuoviamo eventuali vecchi totali.
     rimuoviRigaTotali(worksheet);
 
+    // I valori salvati in precedenza possono essere errati o avere un tipo
+    // Excel diverso da stringa. Ricalcoliamo ogni giorno dai passaggi grezzi.
+    ricalcolaOreGiornaliere(worksheet);
+
     const totali =
         calcolaTotaliMensili(worksheet);
 
@@ -709,6 +744,36 @@ function calcolaOreLavorate(
     return secLavorati;
 }
 
+function ricalcolaOreGiornaliere(worksheet) {
+    worksheet.eachRow((row, rowNumber) => {
+        if (rowNumber <= 1) {
+            return;
+        }
+
+        const nome = row.getCell(1).value;
+        if (
+            typeof nome === 'string' &&
+            nome.trim().toUpperCase() === 'TOTALI MENSILI'
+        ) {
+            return;
+        }
+
+        const secLavorati = calcolaOreLavorate(
+            row.getCell(4).value,
+            row.getCell(5).value,
+            row.getCell(6).value,
+            row.getCell(7).value
+        );
+
+        const secStraordinari = Math.max(
+            0,
+            secLavorati - SOGLIA_8_ORE
+        );
+
+        row.getCell(8).value = secondsToTime(secLavorati);
+        row.getCell(9).value = secondsToTime(secStraordinari);
+    });
+}
 // ============================================================================
 // GESTIONE PRESENZE
 // ============================================================================
