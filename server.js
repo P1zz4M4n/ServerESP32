@@ -1,6 +1,7 @@
 'use strict';
 
 const express = require('express');
+const crypto = require('crypto');
 const fs = require('fs-extra');
 const path = require('path');
 const ExcelJS = require('exceljs');
@@ -52,6 +53,28 @@ const TIMEZONE = process.env.TZ || 'Europe/Rome';
 
 const SOGLIA_8_ORE = 8 * 3600;
 
+// FIX 3: intervallo minimo (in secondi) tra due timbrature dello stesso
+// dipendente nella stessa giornata. Evita che una tessera tenuta vicino al
+// lettore generi più passaggi ravvicinati (chiudendo la giornata a 0 ore).
+// Impostare MIN_INTERVALLO_TIMBRATURE_SEC=0 per disattivare il controllo.
+const MIN_INTERVALLO_TIMBRATURE_SEC = (() => {
+    const grezzo = process.env.MIN_INTERVALLO_TIMBRATURE_SEC;
+
+    if (grezzo === undefined || grezzo === '') {
+        return 60;
+    }
+
+    const valore = Number(grezzo);
+
+    return Number.isFinite(valore) && valore >= 0
+        ? valore
+        : 60;
+})();
+
+// FIX 4: chiave API opzionale. Se impostata, tutte le rotte /api/* richiedono
+// l'header "x-api-key" con lo stesso valore.
+const API_KEY = process.env.API_KEY || null;
+
 const MESI = [
     'Gennaio',
     'Febbraio',
@@ -76,6 +99,50 @@ app.disable('x-powered-by');
 app.use(express.json({
     limit: '100kb'
 }));
+
+// ============================================================================
+// AUTENTICAZIONE API (FIX 4)
+// ============================================================================
+//
+// Senza autenticazione chiunque sulla rete può inviare timbrature false o
+// rinominare i dipendenti. Il controllo è attivo solo se API_KEY è impostata,
+// così il firmware ESP32 esistente continua a funzionare finché non viene
+// aggiornato per inviare l'header x-api-key.
+//
+// /health resta pubblico (serve all'healthcheck di Docker).
+//
+// ============================================================================
+
+function richiediApiKey(req, res, next) {
+    if (!API_KEY) {
+        return next();
+    }
+
+    const fornita = req.get('x-api-key');
+
+    if (typeof fornita === 'string' && fornita.length > 0) {
+        const hashFornita = crypto
+            .createHash('sha256')
+            .update(fornita)
+            .digest();
+
+        const hashAttesa = crypto
+            .createHash('sha256')
+            .update(API_KEY)
+            .digest();
+
+        if (crypto.timingSafeEqual(hashFornita, hashAttesa)) {
+            return next();
+        }
+    }
+
+    return res.status(401).json({
+        status: 'error',
+        message: 'Non autorizzato'
+    });
+}
+
+app.use('/api', richiediApiKey);
 
 // ============================================================================
 // DATABASE SQLITE
@@ -125,6 +192,36 @@ if (!nomiColonne.has('uid') || !nomiColonne.has('nome')) {
     throw new Error(
         `ERRORE DATABASE: la tabella "dipendenti" deve contenere le colonne "uid" e "nome". ` +
         `Colonne trovate: ${Array.from(nomiColonne).join(', ')}`
+    );
+}
+
+// FIX 13: l'UPSERT "ON CONFLICT(uid)" funziona solo se uid è PRIMARY KEY
+// oppure ha un vincolo/indice UNIQUE. In caso contrario ogni registrazione
+// fallirebbe a runtime: meglio accorgersene all'avvio.
+const colonnePk = colonneDipendenti.filter(colonna => colonna.pk > 0);
+
+const uidHaVincoloUnico =
+    (
+        colonnePk.length === 1 &&
+        colonnePk[0].name === 'uid'
+    ) ||
+    db.prepare('PRAGMA index_list(dipendenti)').all().some(indice => {
+        if (!indice.unique) {
+            return false;
+        }
+
+        const colonneIndice = db
+            .prepare(`PRAGMA index_info("${indice.name.replace(/"/g, '""')}")`)
+            .all();
+
+        return colonneIndice.length === 1 &&
+            colonneIndice[0].name === 'uid';
+    });
+
+if (!uidHaVincoloUnico) {
+    throw new Error(
+        'ERRORE DATABASE: la colonna "uid" della tabella "dipendenti" deve essere ' +
+        'PRIMARY KEY oppure avere un vincolo UNIQUE (necessario per l\'UPSERT).'
     );
 }
 
@@ -205,6 +302,8 @@ function conLockExcel(fn) {
 function getDataOraItalia() {
     const now = new Date();
 
+    // FIX 5: hourCycle 'h23' invece di hour12:false. Con hour12:false alcune
+    // versioni di ICU restituiscono "24" a mezzanotte (24:00:05 invece di 00:00:05).
     const parts = new Intl.DateTimeFormat('it-IT', {
         timeZone: TIMEZONE,
         year: 'numeric',
@@ -213,7 +312,7 @@ function getDataOraItalia() {
         hour: '2-digit',
         minute: '2-digit',
         second: '2-digit',
-        hour12: false
+        hourCycle: 'h23'
     }).formatToParts(now);
 
     const valori = {};
@@ -274,20 +373,15 @@ function normalizzaDataExcel(value) {
     // ------------------------------------------------------------
 
     if (value instanceof Date) {
-        const parts = new Intl.DateTimeFormat('it-IT', {
-            timeZone: TIMEZONE,
-            year: 'numeric',
-            month: '2-digit',
-            day: '2-digit'
-        }).formatToParts(value);
-
-        const valori = {};
-
-        for (const part of parts) {
-            valori[part.type] = part.value;
+        if (!Number.isFinite(value.getTime())) {
+            return null;
         }
 
-        return `${valori.year}-${valori.month}-${valori.day}`;
+        // FIX 6: ExcelJS converte il seriale Excel in una Date UTC "ingenua"
+        // (mezzanotte UTC del giorno scritto nella cella). Applicare il fuso
+        // orario del server potrebbe spostare la data di un giorno: si
+        // usano quindi direttamente i componenti UTC.
+        return value.toISOString().slice(0, 10);
     }
 
     // ------------------------------------------------------------
@@ -371,8 +465,9 @@ function timeToSeconds(timeStr) {
     if (!valore) {
         return 0;
     }
-    
-    const parts = timeStr.split(':');
+
+    // FIX 7: si usa il valore già ripulito (prima veniva spezzato timeStr).
+    const parts = valore.split(':');
 
     if (parts.length < 2 || parts.length > 3) {
         return 0;
@@ -491,10 +586,12 @@ function creaStrutturaWorksheet(worksheet) {
 
     const headerRow = worksheet.getRow(1);
 
+    // FIX 8: i colori in ExcelJS vanno espressi in ARGB a 8 cifre
+    // (con 6 cifre Excel può interpretarli in modo errato).
     headerRow.font = {
         bold: true,
         color: {
-            argb: 'FFFFFF'
+            argb: 'FFFFFFFF'
         }
     };
 
@@ -502,7 +599,7 @@ function creaStrutturaWorksheet(worksheet) {
         type: 'pattern',
         pattern: 'solid',
         fgColor: {
-            argb: '1F4E78'
+            argb: 'FF1F4E78'
         }
     };
 
@@ -510,6 +607,31 @@ function creaStrutturaWorksheet(worksheet) {
         vertical: 'middle',
         horizontal: 'center'
     };
+}
+
+// ============================================================================
+// SALVATAGGIO ATOMICO (FIX 1)
+// ============================================================================
+//
+// writeFile() direttamente sul file definitivo, se interrotto (crash,
+// riavvio del container, NAS che si disconnette), lascia un .xlsx
+// troncato e quindi l'intero mese va perso.
+// Si scrive prima su un file temporaneo nella stessa cartella e poi lo si
+// rinomina: il rename è atomico e il file originale resta integro finché
+// la nuova versione non è completa.
+//
+// ============================================================================
+
+async function salvaWorkbook(workbook, percorsoFile) {
+    const percorsoTemp = `${percorsoFile}.${process.pid}.tmp`;
+
+    try {
+        await workbook.xlsx.writeFile(percorsoTemp);
+        await fs.rename(percorsoTemp, percorsoFile);
+    } catch (error) {
+        await fs.remove(percorsoTemp).catch(() => {});
+        throw error;
+    }
 }
 
 // ============================================================================
@@ -642,7 +764,7 @@ function aggiungiTotaliMensili(worksheet) {
         type: 'pattern',
         pattern: 'solid',
         fgColor: {
-            argb: 'D9E1F2'
+            argb: 'FFD9E1F2'
         }
     };
 
@@ -782,14 +904,18 @@ async function gestisciPresenze(
     uid,
     nomeDipendente
 ) {
+    // ------------------------------------------------------------
+    // DATA E ORA CORRENTI
+    // ------------------------------------------------------------
+    //
+    // FIX 2: l'orario viene fissato quando la richiesta ARRIVA, non quando
+    // la coda del lock la libera. Se il NAS è lento, altrimenti le timbrature
+    // in attesa verrebbero registrate con un orario successivo.
+    //
+    const oraAttuale =
+        getDataOraItalia();
+
     return conLockExcel(async () => {
-
-        // ------------------------------------------------------------
-        // DATA E ORA CORRENTI
-        // ------------------------------------------------------------
-
-        const oraAttuale =
-            getDataOraItalia();
 
         const anno =
             oraAttuale.anno;
@@ -966,10 +1092,9 @@ async function gestisciPresenze(
                         valoreData
                     );
 
-                // DEBUG
-                console.log(
-                    `🔎 Riga ${rowNumber}: UID=${rowUid}, DATA=${rowDataKey}`
-                );
+                // FIX 9: rimosso il log di debug stampato per OGNI riga a
+                // ogni timbratura (centinaia di righe di log per passaggio
+                // a fine mese, con crescita incontrollata dei log Docker).
 
                 // ----------------------------------------------------
                 // CONFRONTO
@@ -1032,6 +1157,46 @@ async function gestisciPresenze(
             console.log(
                 `🔄 Aggiornamento riga ${targetRow.number}`
             );
+
+            // --------------------------------------------------------
+            // FIX 3: ANTI DOPPIA LETTURA
+            // --------------------------------------------------------
+            //
+            // Se l'ultima timbratura è troppo recente, quella attuale
+            // viene ignorata (nulla viene modificato né salvato).
+            //
+            // --------------------------------------------------------
+
+            if (MIN_INTERVALLO_TIMBRATURE_SEC > 0) {
+
+                const ultimaTimbraturaSec = Math.max(
+                    timeToSeconds(targetRow.getCell(4).value),
+                    timeToSeconds(targetRow.getCell(5).value),
+                    timeToSeconds(targetRow.getCell(6).value),
+                    timeToSeconds(targetRow.getCell(7).value)
+                );
+
+                const differenzaSec =
+                    timeToSeconds(oraTimbratura) -
+                    ultimaTimbraturaSec;
+
+                if (
+                    differenzaSec >= 0 &&
+                    differenzaSec < MIN_INTERVALLO_TIMBRATURE_SEC
+                ) {
+                    console.warn(
+                        `⚠️ Timbratura ravvicinata ignorata per ${nomeDipendente} ` +
+                        `(${uid}): ${differenzaSec}s dall'ultimo passaggio`
+                    );
+
+                    return {
+                        success: false,
+                        limitReached: false,
+                        duplicate: true,
+                        file: percorsoFile
+                    };
+                }
+            }
 
             const p2 =
                 targetRow.getCell(5);
@@ -1100,13 +1265,15 @@ async function gestisciPresenze(
                     worksheet
                 );
 
-                await workbook.xlsx.writeFile(
+                await salvaWorkbook(
+                    workbook,
                     percorsoFile
                 );
 
                 return {
                     success: false,
                     limitReached: true,
+                    duplicate: false,
                     file: percorsoFile
                 };
             }
@@ -1206,7 +1373,9 @@ async function gestisciPresenze(
             `💾 Salvataggio Excel: ${percorsoFile}`
         );
 
-        await workbook.xlsx.writeFile(
+        // FIX 1: salvataggio atomico (file temporaneo + rename).
+        await salvaWorkbook(
+            workbook,
             percorsoFile
         );
 
@@ -1217,6 +1386,7 @@ async function gestisciPresenze(
         return {
             success: true,
             limitReached: false,
+            duplicate: false,
             file: percorsoFile
         };
     });
@@ -1276,6 +1446,37 @@ app.post(
                     uid,
                     nomeDipendente
                 );
+
+            // --------------------------------------------------------
+            // TIMBRATURA RAVVICINATA IGNORATA (FIX 3)
+            // --------------------------------------------------------
+
+            if (
+                esito.duplicate
+            ) {
+
+                console.log(
+                    '⚠️ Risposta ESP32: timbratura ravvicinata ignorata.'
+                );
+
+                console.log(
+                    '================================='
+                );
+
+                return res.status(200).json({
+                    status:
+                        'duplicate_ignored',
+
+                    dipendente:
+                        nomeDipendente,
+
+                    receivedUid:
+                        uid,
+
+                    message:
+                        'Timbratura ravvicinata ignorata'
+                });
+            }
 
             // --------------------------------------------------------
             // LIMITE 4 TIMBRATURE
@@ -1453,9 +1654,11 @@ app.get(
         try {
 
             // Controlla che il NAS sia effettivamente
-            // accessibile dal container.
+            // accessibile (anche in scrittura) dal container.
+            // FIX 12: verifica anche il permesso di scrittura.
             await fs.access(
-                NAS_BASE_PATH
+                NAS_BASE_PATH,
+                fs.constants.R_OK | fs.constants.W_OK
             );
 
             // Controlla anche che il DB risponda.
@@ -1463,14 +1666,10 @@ app.get(
                 'SELECT 1'
             ).get();
 
+            // FIX 14: l'endpoint è pubblico, quindi non espone più i
+            // percorsi interni di database e NAS.
             return res.status(200).json({
                 status: 'ok',
-
-                database:
-                    DB_PATH,
-
-                nas:
-                    NAS_BASE_PATH,
 
                 timezone:
                     TIMEZONE
@@ -1488,13 +1687,7 @@ app.get(
                 status: 'error',
 
                 message:
-                    'NAS o database non disponibili',
-
-                nas:
-                    NAS_BASE_PATH,
-
-                database:
-                    DB_PATH
+                    'NAS o database non disponibili'
             });
         }
     }
@@ -1516,13 +1709,88 @@ app.use(
             return next(error);
         }
 
-        return res.status(500).json({
+        // FIX 10: gli errori del client (es. JSON malformato, payload troppo
+        // grande) devono restituire 4xx, non 500.
+        const status =
+            Number.isInteger(error.status) &&
+            error.status >= 400 &&
+            error.status < 500
+                ? error.status
+                : 500;
+
+        return res.status(status).json({
             status: 'error',
             message:
-                'Errore interno del server'
+                status === 500
+                    ? 'Errore interno del server'
+                    : 'Richiesta non valida'
         });
     }
 );
+
+// ============================================================================
+// ARRESTO GRADUALE (FIX 11)
+// ============================================================================
+//
+// Docker invia SIGTERM allo stop/riavvio del container. Node, come PID 1,
+// senza handler non si ferma in modo pulito: una scrittura Excel in corso
+// verrebbe interrotta. Qui si smette di accettare richieste, si attende
+// il completamento della coda Excel e si chiude il database.
+//
+// ============================================================================
+
+let server = null;
+let arrestoInCorso = false;
+
+function arrestoGraduale(segnale) {
+    if (arrestoInCorso) {
+        return;
+    }
+
+    arrestoInCorso = true;
+
+    console.log(
+        `🛑 Segnale ${segnale} ricevuto: arresto in corso...`
+    );
+
+    // Uscita forzata se l'arresto non termina entro 15 secondi.
+    setTimeout(() => {
+        console.error('❌ Arresto forzato per timeout.');
+        process.exit(1);
+    }, 15000).unref();
+
+    const concludi = async () => {
+        try {
+            await excelQueue;
+        } catch (_) {
+            // L'errore è già stato gestito dalla richiesta.
+        }
+
+        try {
+            db.close();
+        } catch (_) {
+            // Ignorato: il processo sta terminando.
+        }
+
+        console.log('👋 Server arrestato.');
+        process.exit(0);
+    };
+
+    if (server) {
+        server.close(() => {
+            concludi();
+        });
+
+        if (typeof server.closeIdleConnections === 'function') {
+            server.closeIdleConnections();
+        }
+    } else {
+        concludi();
+    }
+}
+
+process.on('SIGTERM', () => arrestoGraduale('SIGTERM'));
+process.on('SIGINT', () => arrestoGraduale('SIGINT'));
 
 // ============================================================================
 // AVVIO SERVER
@@ -1531,7 +1799,14 @@ app.use(
 async function avviaServer() {
     try {
         await fs.access(DB_PATH);
-        await fs.access(NAS_BASE_PATH);
+
+        // FIX 12: il NAS deve essere anche scrivibile, non solo raggiungibile
+        // (un mount in sola lettura passerebbe il controllo ma fallirebbe
+        // a ogni timbratura).
+        await fs.access(
+            NAS_BASE_PATH,
+            fs.constants.R_OK | fs.constants.W_OK
+        );
 
         db.prepare('SELECT 1').get();
 
@@ -1543,12 +1818,24 @@ async function avviaServer() {
         console.log(`📁 NAS: ${NAS_BASE_PATH}`);
         console.log(`🌍 Timezone: ${TIMEZONE}`);
         console.log(`🔌 Porta: ${PORT}`);
+        console.log(
+            `⏳ Intervallo minimo tra timbrature: ${MIN_INTERVALLO_TIMBRATURE_SEC}s`
+        );
         console.log('----------------------------------------------');
         console.log('✓ Database presente e valido');
-        console.log('✓ NAS raggiungibile');
+        console.log('✓ NAS raggiungibile e scrivibile');
+
+        if (API_KEY) {
+            console.log('✓ Autenticazione API attiva (x-api-key)');
+        } else {
+            console.warn(
+                '⚠️ API_KEY non impostata: le rotte /api/* sono PUBBLICHE.'
+            );
+        }
+
         console.log('==============================================');
 
-        app.listen(
+        server = app.listen(
             PORT,
             '0.0.0.0',
             () => {
