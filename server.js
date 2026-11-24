@@ -11,12 +11,9 @@ const app = express();
 
 const PORT = Number(process.env.PORT || 3000);
 
-// ============================================================================
-// CONFIGURAZIONE
-// ============================================================================
-
-// IMPORTANTE:
-// Il NAS deve essere montato nel container Docker.
+// CONFIGURATION
+// IMPORTANT:
+// The NAS must be mounted in the Docker container.
 //
 const NAS_BASE_PATH = process.env.NAS_BASE_PATH;
 const DB_PATH = process.env.DB_PATH;
@@ -47,16 +44,15 @@ if (!path.isAbsolute(NAS_BASE_PATH)) {
     );
 }
 // Timezone.
-// In Docker impostare:
+// Set in Docker:
 // TZ=Europe/Rome
 const TIMEZONE = process.env.TZ || 'Europe/Rome';
 
 const SOGLIA_8_ORE = 8 * 3600;
-
-// FIX 3: intervallo minimo (in secondi) tra due timbrature dello stesso
-// dipendente nella stessa giornata. Evita che una tessera tenuta vicino al
-// lettore generi più passaggi ravvicinati (chiudendo la giornata a 0 ore).
-// Impostare MIN_INTERVALLO_TIMBRATURE_SEC=0 per disattivare il controllo.
+// FIX 3: minimum interval (in seconds) between two clock-ins by the same
+// employee on the same day. Prevents a card held near the
+// reader from generating multiple close-together scans (closing the day with 0 hours).
+// Set MIN_INTERVALLO_TIMBRATURE_SEC=0 to disable the check.
 const MIN_INTERVALLO_TIMBRATURE_SEC = (() => {
     const grezzo = process.env.MIN_INTERVALLO_TIMBRATURE_SEC;
 
@@ -70,9 +66,8 @@ const MIN_INTERVALLO_TIMBRATURE_SEC = (() => {
         ? valore
         : 60;
 })();
-
-// FIX 4: chiave API opzionale. Se impostata, tutte le rotte /api/* richiedono
-// l'header "x-api-key" con lo stesso valore.
+// FIX 4: optional API key. If set, all /api/* routes require
+// the "x-api-key" header with the same value.
 const API_KEY = process.env.API_KEY || null;
 
 const MESI = [
@@ -90,28 +85,22 @@ const MESI = [
     'Dicembre'
 ];
 
-// ============================================================================
 // EXPRESS
-// ============================================================================
-
 app.disable('x-powered-by');
 
 app.use(express.json({
     limit: '100kb'
 }));
 
-// ============================================================================
-// AUTENTICAZIONE API (FIX 4)
-// ============================================================================
+
+// API AUTHENTICATION (FIX 4)
 //
-// Senza autenticazione chiunque sulla rete può inviare timbrature false o
-// rinominare i dipendenti. Il controllo è attivo solo se API_KEY è impostata,
-// così il firmware ESP32 esistente continua a funzionare finché non viene
-// aggiornato per inviare l'header x-api-key.
+// Without authentication, anyone on the network can submit fake clock-ins or
+// rename employees. This check is active only if API_KEY is set,
+// so the existing ESP32 firmware continues to work until it is
+// updated to send the x-api-key header.
 //
-// /health resta pubblico (serve all'healthcheck di Docker).
-//
-// ============================================================================
+// /health remains public (used by Docker health checks).
 
 function richiediApiKey(req, res, next) {
     if (!API_KEY) {
@@ -144,10 +133,7 @@ function richiediApiKey(req, res, next) {
 
 app.use('/api', richiediApiKey);
 
-// ============================================================================
-// DATABASE SQLITE
-// ============================================================================
-
+// SQLITE DATABASE
 if (!fs.pathExistsSync(DB_PATH)) {
     throw new Error(
         `ERRORE DATABASE: file non trovato: ${DB_PATH}. ` +
@@ -194,10 +180,9 @@ if (!nomiColonne.has('uid') || !nomiColonne.has('nome')) {
         `Colonne trovate: ${Array.from(nomiColonne).join(', ')}`
     );
 }
-
-// FIX 13: l'UPSERT "ON CONFLICT(uid)" funziona solo se uid è PRIMARY KEY
-// oppure ha un vincolo/indice UNIQUE. In caso contrario ogni registrazione
-// fallirebbe a runtime: meglio accorgersene all'avvio.
+// FIX 13: the "ON CONFLICT(uid)" UPSERT works only if uid is a PRIMARY KEY
+// or has a UNIQUE constraint/index. Otherwise, every registration
+// would fail at runtime, so it is better to catch this at startup.
 const colonnePk = colonneDipendenti.filter(colonna => colonna.pk > 0);
 
 const uidHaVincoloUnico =
@@ -252,58 +237,47 @@ function ottieniNomeDipendente(uid) {
     }
 
     console.warn(
-        `⚠️ UID non presente nel database: [${uid}]`
+        'UID non presente nel database: [${uid}]`
     );
 
     return `Sconosciuto (${uid})`;
 }
 
-// ============================================================================
-// LOCK SCRITTURA EXCEL
-// ============================================================================
+// EXCEL WRITE LOCK
 //
-// Evita che due richieste NFC contemporanee leggano e scrivano
-// contemporaneamente lo stesso file Excel.
+// Prevents two concurrent NFC requests from reading and writing
+// the same Excel file at the same time.
 //
-// ATTENZIONE:
-// Questo lock funziona all'interno dello stesso processo Node.js.
-// Se utilizzi più container Node.js contemporaneamente sullo stesso Excel,
-// servirà un sistema di lock distribuito.
-//
-// ============================================================================
-
+// WARNING:
+// This lock works within the same Node.js process.
+// If you use multiple Node.js containers on the same Excel file at the same time,
+// a distributed locking system will be needed.
 let excelQueue = Promise.resolve();
 
 function conLockExcel(fn) {
     const operazione = excelQueue.then(() => fn());
-
-    // Manteniamo la coda attiva anche se un'operazione fallisce.
+    // Keep the queue active even if an operation fails.
     excelQueue = operazione.catch(() => {});
 
     return operazione;
 }
 
-// ============================================================================
-// DATA E ORA
-// ============================================================================
+// DATE AND TIME
 //
-// Restituisce:
-// - anno
-// - mese
-// - giorno
-// - dataKey -> formato stabile YYYY-MM-DD
-// - data -> formato visualizzato DD/MM/YYYY
-// - ora -> HH:mm:ss
+// Returns:
+// - year
+// - month
+// - day
+// - dataKey -> stable format YYYY-MM-DD
+// - date -> displayed format DD/MM/YYYY
+// - time -> HH:mm:ss
 //
-// dataKey è fondamentale per confrontare correttamente i giorni.
-// NON utilizziamo direttamente il testo visualizzato nell'Excel.
-// ============================================================================
-
+// dataKey is essential for correctly comparing days.
+// Do NOT use the text displayed in Excel directly.
 function getDataOraItalia() {
     const now = new Date();
-
-    // FIX 5: hourCycle 'h23' invece di hour12:false. Con hour12:false alcune
-    // versioni di ICU restituiscono "24" a mezzanotte (24:00:05 invece di 00:00:05).
+    // FIX 5: use hourCycle 'h23' instead of hour12:false. With hour12:false, some
+    // ICU versions return "24" at midnight (24:00:05 instead of 00:00:05).
     const parts = new Intl.DateTimeFormat('it-IT', {
         timeZone: TIMEZONE,
         year: 'numeric',
@@ -329,87 +303,62 @@ function getDataOraItalia() {
         anno,
         mese,
         giorno,
-
-        // Identificatore tecnico della giornata.
-        // Esempio: 2026-09-24
+        // Technical identifier for the day.
+        // Example: 2026-09-24
         dataKey: `${anno}-${String(mese).padStart(2, '0')}-${giorno}`,
-
-        // Formato visualizzato nell'Excel.
-        // Esempio: 24/09/2026
+        // Format displayed in Excel.
+        // Example: 24/09/2026
         data: `${giorno}/${String(mese).padStart(2, '0')}/${anno}`,
-
-        // Ora della timbratura.
+        // Clock-in time.
         ora: `${valori.hour}:${valori.minute}:${valori.second}`
     };
 }
 
-// ============================================================================
-// CONVERSIONE DATA EXCEL
-// ============================================================================
+// EXCEL DATE CONVERSION
 //
-// ExcelJS può restituire:
-// - stringa
+// ExcelJS may return:
+// - string
 // - Date
-// - altri valori.
+// - other values.
 //
-// Questa funzione converte tutto in:
+// This function converts everything to:
 // YYYY-MM-DD
 //
-// Esempi:
+// Examples:
 //
 // 24/09/2026 -> 2026-09-24
 // 2026-09-24 -> 2026-09-24
 // Date(...)  -> 2026-09-24
-//
-// ============================================================================
-
 function normalizzaDataExcel(value) {
     if (!value) {
         return null;
     }
-
-    // ------------------------------------------------------------
-    // Caso 1: ExcelJS restituisce una vera Date
-    // ------------------------------------------------------------
-
+    // Case 1: ExcelJS returns an actual Date
     if (value instanceof Date) {
         if (!Number.isFinite(value.getTime())) {
             return null;
         }
-
-        // FIX 6: ExcelJS converte il seriale Excel in una Date UTC "ingenua"
-        // (mezzanotte UTC del giorno scritto nella cella). Applicare il fuso
-        // orario del server potrebbe spostare la data di un giorno: si
-        // usano quindi direttamente i componenti UTC.
+        // FIX 6: ExcelJS converts the Excel serial value to a "naive" UTC Date
+        // (UTC midnight of the day written in the cell). Applying the server
+        // timezone could shift the date by one day, so the UTC components
+        // are used directly.
         return value.toISOString().slice(0, 10);
     }
-
-    // ------------------------------------------------------------
-    // Caso 2: valore testuale
-    // ------------------------------------------------------------
-
+    // Case 2: text value
     const valore = String(value).trim();
 
     if (!valore) {
         return null;
     }
-
-    // ------------------------------------------------------------
-    // Formato ISO:
+    // ISO format:
     //
     // 2026-09-24
-    // ------------------------------------------------------------
-
     if (/^\d{4}-\d{2}-\d{2}$/.test(valore)) {
         return valore;
     }
-
-    // ------------------------------------------------------------
-    // Formato italiano:
+    // Italian format:
     //
     // 24/09/2026
-    // ------------------------------------------------------------
-
     const match = valore.match(
         /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/
     );
@@ -425,18 +374,14 @@ function normalizzaDataExcel(value) {
     return null;
 }
 
-// ============================================================================
-// UTILITÀ ORE
-// ============================================================================
-
+// TIME UTILITIES
 function timeToSeconds(timeStr) {
     if (timeStr === null || timeStr === undefined || timeStr === '') {
         return 0;
     }
-
-    // ExcelJS restituisce spesso le celle formattate come ora come Date,
-    // non come stringhe. I componenti UTC rappresentano l'ora memorizzata
-    // nel seriale Excel senza applicare il fuso orario del server.
+    // ExcelJS often returns cells formatted as time as Date objects,
+    // not strings. The UTC components represent the time stored
+    // in the Excel serial value without applying the server timezone.
     if (timeStr instanceof Date) {
         if (!Number.isFinite(timeStr.getTime())) {
             return 0;
@@ -446,9 +391,8 @@ function timeToSeconds(timeStr) {
             timeStr.getUTCMinutes() * 60 +
             timeStr.getUTCSeconds();
     }
-
-    // Supporta anche un valore numerico Excel che rappresenta una frazione
-    // di giornata (es. 0,5 = 12:00).
+    // Also supports an Excel numeric value representing a fraction
+    // of a day (e.g. 0.5 = 12:00).
     if (typeof timeStr === 'number') {
         if (!Number.isFinite(timeStr) || timeStr < 0 || timeStr >= 1) {
             return 0;
@@ -465,8 +409,7 @@ function timeToSeconds(timeStr) {
     if (!valore) {
         return 0;
     }
-
-    // FIX 7: si usa il valore già ripulito (prima veniva spezzato timeStr).
+    // FIX 7: use the already-trimmed value (previously timeStr was split).
     const parts = valore.split(':');
 
     if (parts.length < 2 || parts.length > 3) {
@@ -509,10 +452,7 @@ function secondsToTime(totalSec) {
     ].join(':');
 }
 
-// ============================================================================
-// VALIDAZIONE UID
-// ============================================================================
-
+// UID VALIDATION
 function normalizzaUid(uid) {
     if (typeof uid !== 'string') {
         return null;
@@ -531,10 +471,7 @@ function normalizzaUid(uid) {
     return valore;
 }
 
-// ============================================================================
-// STRUTTURA EXCEL
-// ============================================================================
-
+// EXCEL STRUCTURE
 function creaStrutturaWorksheet(worksheet) {
     worksheet.columns = [
         {
@@ -585,9 +522,8 @@ function creaStrutturaWorksheet(worksheet) {
     ];
 
     const headerRow = worksheet.getRow(1);
-
-    // FIX 8: i colori in ExcelJS vanno espressi in ARGB a 8 cifre
-    // (con 6 cifre Excel può interpretarli in modo errato).
+    // FIX 8: colors in ExcelJS must be expressed as 8-digit ARGB
+    // (with 6 digits, Excel may interpret them incorrectly).
     headerRow.font = {
         bold: true,
         color: {
@@ -609,19 +545,14 @@ function creaStrutturaWorksheet(worksheet) {
     };
 }
 
-// ============================================================================
-// SALVATAGGIO ATOMICO (FIX 1)
-// ============================================================================
+// ATOMIC SAVE (FIX 1)
 //
-// writeFile() direttamente sul file definitivo, se interrotto (crash,
-// riavvio del container, NAS che si disconnette), lascia un .xlsx
-// troncato e quindi l'intero mese va perso.
-// Si scrive prima su un file temporaneo nella stessa cartella e poi lo si
-// rinomina: il rename è atomico e il file originale resta integro finché
-// la nuova versione non è completa.
-//
-// ============================================================================
-
+// Writing directly to the final file with writeFile(), if interrupted (crash,
+// container restart, NAS disconnect), leaves a truncated .xlsx
+// file, causing the entire month to be lost.
+// First write to a temporary file in the same folder, then
+// rename it: the rename is atomic, and the original file remains intact until
+// the new version is complete.
 async function salvaWorkbook(workbook, percorsoFile) {
     const percorsoTemp = `${percorsoFile}.${process.pid}.tmp`;
 
@@ -634,13 +565,10 @@ async function salvaWorkbook(workbook, percorsoFile) {
     }
 }
 
-// ============================================================================
-// RIGA TOTALI MENSILI
-// ============================================================================
-
+// MONTHLY TOTALS ROW
 function rimuoviRigaTotali(worksheet) {
-    // Un file già affetto dal problema può contenere più righe totali.
-    // Rimuoverne una sola a ogni timbratura le farebbe accumulare nel tempo.
+    // A file already affected by this issue may contain multiple totals rows.
+    // Removing only one at each clock-in would cause them to accumulate over time.
     for (
         let rowNumber = worksheet.rowCount;
         rowNumber >= 2;
@@ -656,10 +584,9 @@ function rimuoviRigaTotali(worksheet) {
         }
     }
 }
-
-// Elimina solo le righe vuote in coda (comprese le righe modello con
-// 00:00:00 nelle colonne dei totali). ExcelJS le considera righe usate:
-// lasciarle lì farebbe accodare le nuove giornate molto più in basso.
+// Removes only trailing empty rows (including template rows with
+// 00:00:00 in the totals columns). ExcelJS considers them used rows:
+// leaving them would cause new days to be appended much farther down.
 function eRigaSegnaposto(row) {
     const vuoto = value =>
         value === null ||
@@ -691,10 +618,7 @@ function rimuoviSegnapostoFinali(worksheet) {
     }
 }
 
-// ============================================================================
-// CALCOLO TOTALI MENSILI
-// ============================================================================
-
+// MONTHLY TOTALS CALCULATION
 function calcolaTotaliMensili(worksheet) {
     let totMeseLavoratoSec = 0;
     let totMeseStraordinariSec = 0;
@@ -703,8 +627,7 @@ function calcolaTotaliMensili(worksheet) {
         if (rowNumber <= 1) {
             return;
         }
-
-        // Non contare mai la riga TOTALI MENSILI.
+        // Never count the MONTHLY TOTALS row.
         if (
             row.getCell(1).value ===
             'TOTALI MENSILI'
@@ -727,23 +650,18 @@ function calcolaTotaliMensili(worksheet) {
     };
 }
 
-// ============================================================================
-// AGGIUNTA TOTALI MENSILI
-// ============================================================================
-
+// ADD MONTHLY TOTALS
 function aggiungiTotaliMensili(worksheet) {
-    // Prima rimuoviamo eventuali vecchi totali.
+    // First remove any existing totals.
     rimuoviRigaTotali(worksheet);
-
-    // I valori salvati in precedenza possono essere errati o avere un tipo
-    // Excel diverso da stringa. Ricalcoliamo ogni giorno dai passaggi grezzi.
+    // Previously saved values may be incorrect or have a type
+    // other than a string in Excel. Recalculate each day from the raw clock-ins.
     ricalcolaOreGiornaliere(worksheet);
 
     const totali =
         calcolaTotaliMensili(worksheet);
-
-    // Array esplicito: le chiavi definite in worksheet.columns non sono
-    // conservate nel file XLSX e non sono disponibili dopo readFile().
+    // Explicit array: the keys defined in worksheet.columns are not
+    // preserved in the XLSX file and are unavailable after readFile().
     const rigaTotali = worksheet.addRow([
         'TOTALI MENSILI',
         '',
@@ -774,32 +692,27 @@ function aggiungiTotaliMensili(worksheet) {
     };
 }
 
-// ============================================================================
-// CALCOLO ORE LAVORATE
-// ============================================================================
+// CALCULATE HOURS WORKED
 //
-// 2 timbrature:
+// 2 clock-ins:
 //
-// P1 = Entrata
-// P2 = Uscita
+// P1 = Clock-in
+// P2 = Clock-out
 //
-// Totale:
+// Total:
 // P2 - P1
 //
 //
 //
-// 4 timbrature:
+// 4 clock-ins:
 //
-// P1 = Entrata
-// P2 = Uscita pausa
-// P3 = Rientro pausa
-// P4 = Uscita
+// P1 = Clock-in
+// P2 = Clock-out pausa
+// P3 = Break end
+// P4 = Clock-out
 //
-// Totale:
+// Total:
 // (P2 - P1) + (P4 - P3)
-//
-// ============================================================================
-
 function calcolaOreLavorate(
     p1,
     p2,
@@ -812,11 +725,7 @@ function calcolaOreLavorate(
     const t4 = timeToSeconds(p4);
 
     let secLavorati = 0;
-
-    // ------------------------------------------------------------
-    // 2 timbrature
-    // ------------------------------------------------------------
-
+    // 2 clock-ins
     if (
         p1 &&
         p2 &&
@@ -829,11 +738,7 @@ function calcolaOreLavorate(
                 t2 - t1
             );
     }
-
-    // ------------------------------------------------------------
-    // 4 timbrature
-    // ------------------------------------------------------------
-
+    // 4 clock-ins
     else if (
         p1 &&
         p2 &&
@@ -856,13 +761,9 @@ function calcolaOreLavorate(
             mattina +
             pomeriggio;
     }
-
-    // ------------------------------------------------------------
-    // 1 oppure 3 timbrature
+    // 1 or 3 clock-ins
     //
-    // Non possiamo ancora determinare il totale.
-    // ------------------------------------------------------------
-
+    // The total cannot be determined yet.
     return secLavorati;
 }
 
@@ -896,22 +797,17 @@ function ricalcolaOreGiornaliere(worksheet) {
         row.getCell(9).value = secondsToTime(secStraordinari);
     });
 }
-// ============================================================================
-// GESTIONE PRESENZE
-// ============================================================================
 
+// ATTENDANCE MANAGEMENT
 async function gestisciPresenze(
     uid,
     nomeDipendente
 ) {
-    // ------------------------------------------------------------
-    // DATA E ORA CORRENTI
-    // ------------------------------------------------------------
+    // CURRENT DATE AND TIME
     //
-    // FIX 2: l'orario viene fissato quando la richiesta ARRIVA, non quando
-    // la coda del lock la libera. Se il NAS è lento, altrimenti le timbrature
-    // in attesa verrebbero registrate con un orario successivo.
-    //
+    // FIX 2: the time is fixed when the request ARRIVES, not when
+    // the lock queue releases it. Otherwise, if the NAS is slow, pending clock-ins
+    // would be recorded with a later time.
     const oraAttuale =
         getDataOraItalia();
 
@@ -934,11 +830,7 @@ async function gestisciPresenze(
 
         const oraTimbratura =
             oraAttuale.ora;
-
-        // ------------------------------------------------------------
-        // CARTELLA ANNO
-        // ------------------------------------------------------------
-
+        // YEAR FOLDER
         await fs.access(NAS_BASE_PATH);
 
         const cartellaAnno =
@@ -950,11 +842,7 @@ async function gestisciPresenze(
         await fs.ensureDir(
             cartellaAnno
         );
-
-        // ------------------------------------------------------------
-        // FILE MENSILE
-        // ------------------------------------------------------------
-
+        // MONTHLY FILE
         const nomeFile =
             `Presenze_${meseNome}_${anno}.xlsx`;
 
@@ -966,21 +854,17 @@ async function gestisciPresenze(
 
         console.log('');
         console.log(
-            `📅 Data: ${dataOggi}`
+            `Date: ${dataOggi}`
         );
 
         console.log(
-            `🔑 DataKey: ${dataOggiKey}`
+            `DateKey: ${dataOggiKey}`
         );
 
         console.log(
-            `📄 File: ${percorsoFile}`
+            `File: ${percorsoFile}`
         );
-
-        // ------------------------------------------------------------
-        // CARICA / CREA WORKBOOK
-        // ------------------------------------------------------------
-
+        // LOAD / CREATE WORKBOOK
         const workbook =
             new ExcelJS.Workbook();
 
@@ -992,7 +876,7 @@ async function gestisciPresenze(
             )
         ) {
             console.log(
-                '📂 File Excel esistente: caricamento...'
+                'Existing Excel file: loading...'
             );
 
             await workbook.xlsx.readFile(
@@ -1003,12 +887,11 @@ async function gestisciPresenze(
                 workbook.getWorksheet(
                     'Presenze'
                 );
-
-            // Se il foglio non esiste,
-            // lo creiamo.
+            // If the worksheet does not exist,
+            // create it.
             if (!worksheet) {
                 console.warn(
-                    '⚠️ Foglio "Presenze" non trovato. Creazione...'
+                    'Foglio "Presenze" non trovato. Creazione...'
                 );
 
                 worksheet =
@@ -1024,7 +907,7 @@ async function gestisciPresenze(
 
         else {
             console.log(
-                '🆕 File Excel non esistente: creazione...'
+                'Excel file does not exist: creating it...'
             );
 
             worksheet =
@@ -1036,29 +919,19 @@ async function gestisciPresenze(
                 worksheet
             );
         }
-
-        // ------------------------------------------------------------
-        // RIMUOVI TEMPORANEAMENTE I TOTALI
-        // ------------------------------------------------------------
+        
+        // TEMPORARILY REMOVE TOTALS
         //
-        // Questo è fondamentale:
-        // la riga TOTALI MENSILI non deve essere
-        // considerata durante la ricerca del dipendente.
-        //
-        // ------------------------------------------------------------
-
+        // This is essential:
+        // the MONTHLY TOTALS row must not be
+        // included when searching for the employee.
         rimuoviRigaTotali(
             worksheet
         );
-
-        // Rimuove i segnaposto finali prima di accodare i dati reali.
+        // Remove trailing placeholders before appending real data.
         rimuoviSegnapostoFinali(worksheet);
-
-        // ------------------------------------------------------------
-        // CERCA LA RIGA DEL DIPENDENTE
-        // NELLA GIORNATA CORRENTE
-        // ------------------------------------------------------------
-
+        // FIND THE EMPLOYEE ROW
+        // FOR THE CURRENT DAY
         let targetRow = null;
 
         worksheet.eachRow(
@@ -1073,41 +946,32 @@ async function gestisciPresenze(
 
                 const valoreData =
                     row.getCell(3).value;
-
-                // Normalizzazione UID
+                // UID normalization
                 const rowUid =
                     String(
                         valoreUid || ''
                     ).trim().toUpperCase();
-
-                // Normalizzazione data.
+                // Date normalization.
                 //
-                // Può essere:
+                // May be:
                 // 24/09/2026
                 // 2026-09-24
                 // Date
-                //
                 const rowDataKey =
                     normalizzaDataExcel(
                         valoreData
                     );
 
-                // FIX 9: rimosso il log di debug stampato per OGNI riga a
-                // ogni timbratura (centinaia di righe di log per passaggio
-                // a fine mese, con crescita incontrollata dei log Docker).
-
-                // ----------------------------------------------------
-                // CONFRONTO
-                // ----------------------------------------------------
+                // FIX 9: removed the debug log printed for EVERY row on
+                // each clock-in (hundreds of log lines per scan
+                // at the end of the month, causing uncontrolled growth of Docker logs).
+                // COMPARISON
                 //
-                // STESSO UID
+                // SAME UID
                 // +
-                // STESSO GIORNO
+                // SAME DAY
                 //
-                // = aggiorna questa riga
-                //
-                // ----------------------------------------------------
-
+                // = update this row
                 if (
                     rowUid === uid &&
                     rowDataKey === dataOggiKey
@@ -1115,20 +979,16 @@ async function gestisciPresenze(
                     targetRow = row;
 
                     console.log(
-                        `✅ Trovata riga odierna: ${rowNumber}`
+                        `Found today’s row: ${rowNumber}`
                     );
                 }
             }
         );
-
-        // ------------------------------------------------------------
-        // NUOVA GIORNATA
-        // ------------------------------------------------------------
-
+        // NEW DAY
         if (!targetRow) {
 
             console.log(
-                '🆕 Nessuna riga per oggi: creazione nuova riga.'
+                'No row for today: creating a new row.'
             );
 
             targetRow = worksheet.addRow([
@@ -1144,29 +1004,19 @@ async function gestisciPresenze(
             ]);
 
             console.log(
-                `➕ Nuova riga creata: ${targetRow.number}`
+                `➕ New row created: ${targetRow.number}`
             );
         }
-
-        // ------------------------------------------------------------
-        // GIORNATA ESISTENTE
-        // ------------------------------------------------------------
-
+        // EXISTING DAY
         else {
 
             console.log(
-                `🔄 Aggiornamento riga ${targetRow.number}`
+                'Updating row ${targetRow.number}`
             );
-
-            // --------------------------------------------------------
-            // FIX 3: ANTI DOPPIA LETTURA
-            // --------------------------------------------------------
+            // FIX 3: DUPLICATE SCAN PREVENTION
             //
-            // Se l'ultima timbratura è troppo recente, quella attuale
-            // viene ignorata (nulla viene modificato né salvato).
-            //
-            // --------------------------------------------------------
-
+            // If the last clock-in was too recent, the current one
+            // is ignored (nothing is changed or saved).
             if (MIN_INTERVALLO_TIMBRATURE_SEC > 0) {
 
                 const ultimaTimbraturaSec = Math.max(
@@ -1185,7 +1035,7 @@ async function gestisciPresenze(
                     differenzaSec < MIN_INTERVALLO_TIMBRATURE_SEC
                 ) {
                     console.warn(
-                        `⚠️ Timbratura ravvicinata ignorata per ${nomeDipendente} ` +
+                        `Timbratura ravvicinata ignorata per ${nomeDipendente} ` +
                         `(${uid}): ${differenzaSec}s dall'ultimo passaggio`
                     );
 
@@ -1206,61 +1056,44 @@ async function gestisciPresenze(
 
             const p4 =
                 targetRow.getCell(7);
-
-            // --------------------------------------------------------
-            // 2° PASSAGGIO
-            // --------------------------------------------------------
-
+            // 2ND SCAN
             if (!p2.value) {
 
                 p2.value =
                     oraTimbratura;
 
                 console.log(
-                    '🟡 2° passaggio registrato.'
+                    '2nd scan recorded.'
                 );
             }
-
-            // --------------------------------------------------------
-            // 3° PASSAGGIO
-            // --------------------------------------------------------
-
+            // 3RD SCAN
             else if (!p3.value) {
 
                 p3.value =
                     oraTimbratura;
 
                 console.log(
-                    '🟠 3° passaggio registrato.'
+                    '3rd scan recorded.'
                 );
             }
-
-            // --------------------------------------------------------
-            // 4° PASSAGGIO
-            // --------------------------------------------------------
-
+            // 4TH SCAN
             else if (!p4.value) {
 
                 p4.value =
                     oraTimbratura;
 
                 console.log(
-                    '🔴 4° passaggio registrato.'
+                    '4th scan recorded.'
                 );
             }
-
-            // --------------------------------------------------------
-            // OLTRE 4 PASSAGGI
-            // --------------------------------------------------------
-
+            // MORE THAN 4 SCANS
             else {
 
                 console.warn(
-                    `⚠️ Limite di 4 timbrature raggiunto per ${nomeDipendente} (${uid})`
+                    `Limite di 4 timbrature raggiunto per ${nomeDipendente} (${uid})`
                 );
-
-                // Ricrea i totali senza modificare
-                // la riga della giornata.
+                // Recreate the totals without changing
+                // the day’s row.
                 aggiungiTotaliMensili(
                     worksheet
                 );
@@ -1278,11 +1111,7 @@ async function gestisciPresenze(
                 };
             }
         }
-
-        // ------------------------------------------------------------
-        // LETTURA PASSAGGI
-        // ------------------------------------------------------------
-
+        // READ SCANS
         const p1 =
             targetRow.getCell(4).value;
 
@@ -1294,11 +1123,7 @@ async function gestisciPresenze(
 
         const p4 =
             targetRow.getCell(7).value;
-
-        // ------------------------------------------------------------
-        // CALCOLO ORE
-        // ------------------------------------------------------------
-
+        // CALCULATE HOURS
         const secLavorati =
             calcolaOreLavorate(
                 p1,
@@ -1328,59 +1153,46 @@ async function gestisciPresenze(
             vertical: 'middle',
             horizontal: 'center'
         };
-
-        // ------------------------------------------------------------
-        // STAMPA DEBUG
-        // ------------------------------------------------------------
-
+        // DEBUG OUTPUT
         console.log(
-            `⏱️ P1: ${p1 || '-'}`
+            `P1: ${p1 || '-'}`
         );
 
         console.log(
-            `⏱️ P2: ${p2 || '-'}`
+            `P2: ${p2 || '-'}`
         );
 
         console.log(
-            `⏱️ P3: ${p3 || '-'}`
+            `P3: ${p3 || '-'}`
         );
 
         console.log(
-            `⏱️ P4: ${p4 || '-'}`
+            `P4: ${p4 || '-'}`
         );
 
         console.log(
-            `⏱️ Totale: ${secondsToTime(secLavorati)}`
+            `Total: ${secondsToTime(secLavorati)}`
         );
 
         console.log(
-            `⏱️ Straordinario: ${secondsToTime(secStraordinari)}`
+            `Overtime: ${secondsToTime(secStraordinari)}`
         );
-
-        // ------------------------------------------------------------
-        // TOTALI MENSILI
-        // ------------------------------------------------------------
-
+        // MONTHLY TOTALS
         aggiungiTotaliMensili(
             worksheet
         );
-
-        // ------------------------------------------------------------
-        // SALVATAGGIO
-        // ------------------------------------------------------------
-
+        // SAVING
         console.log(
-            `💾 Salvataggio Excel: ${percorsoFile}`
+            `Saving Excel file: ${percorsoFile}`
         );
-
-        // FIX 1: salvataggio atomico (file temporaneo + rename).
+        // FIX 1: atomic save (temporary file + rename).
         await salvaWorkbook(
             workbook,
             percorsoFile
         );
 
         console.log(
-            '✅ Excel salvato correttamente.'
+            'Excel file saved successfully.'
         );
 
         return {
@@ -1391,11 +1203,7 @@ async function gestisciPresenze(
         };
     });
 }
-
-// ============================================================================
-// API NFC
-// ============================================================================
-
+// NFC API
 app.post(
     '/api/nfc',
     async (req, res, next) => {
@@ -1430,15 +1238,15 @@ app.post(
             );
 
             console.log(
-                `🟢 [${timestamp}] TIMBRATURA RICEVUTA`
+                `[${timestamp}] CLOCK-IN RECEIVED`
             );
 
             console.log(
-                `👤 Dipendente: ${nomeDipendente}`
+                `Employee: ${nomeDipendente}`
             );
 
             console.log(
-                `🆔 UID: ${uid}`
+                `UID: ${uid}`
             );
 
             const esito =
@@ -1446,17 +1254,13 @@ app.post(
                     uid,
                     nomeDipendente
                 );
-
-            // --------------------------------------------------------
-            // TIMBRATURA RAVVICINATA IGNORATA (FIX 3)
-            // --------------------------------------------------------
-
+            // CLOSE-TOGETHER CLOCK-IN IGNORED (FIX 3)
             if (
                 esito.duplicate
             ) {
 
                 console.log(
-                    '⚠️ Risposta ESP32: timbratura ravvicinata ignorata.'
+                    'ESP32 response: close-together clock-in ignored.'
                 );
 
                 console.log(
@@ -1477,17 +1281,13 @@ app.post(
                         'Timbratura ravvicinata ignorata'
                 });
             }
-
-            // --------------------------------------------------------
-            // LIMITE 4 TIMBRATURE
-            // --------------------------------------------------------
-
+            // 4 CLOCK-IN LIMIT
             if (
                 esito.limitReached
             ) {
 
                 console.log(
-                    '⚠️ Risposta ESP32: limite raggiunto.'
+                    'ESP32 response: limit reached.'
                 );
 
                 console.log(
@@ -1508,13 +1308,9 @@ app.post(
                         'Limite massimo di 4 timbrature giornaliere raggiunto'
                 });
             }
-
-            // --------------------------------------------------------
-            // SUCCESSO
-            // --------------------------------------------------------
-
+            // SUCCESS
             console.log(
-                `💾 Salvato su Excel NAS: ${esito.file}`
+                `Saved to NAS Excel file: ${esito.file}`
             );
 
             console.log(
@@ -1539,10 +1335,7 @@ app.post(
     }
 );
 
-// ============================================================================
-// API DIPENDENTI - INSERIMENTO / MODIFICA
-// ============================================================================
-
+// EMPLOYEE API - ADD / UPDATE
 app.post(
     '/api/dipendenti',
     (req, res) => {
@@ -1583,7 +1376,7 @@ app.post(
             );
 
             console.log(
-                `✅ Dipendente registrato: [${uid}] -> ${nome}`
+                `Employee registered: [${uid}] -> ${nome}`
             );
 
             return res.status(200).json({
@@ -1596,7 +1389,7 @@ app.post(
         catch (error) {
 
             console.error(
-                '❌ Errore registrazione dipendente:',
+                'Errore registrazione dipendente:',
                 error
             );
 
@@ -1609,10 +1402,7 @@ app.post(
     }
 );
 
-// ============================================================================
-// API DIPENDENTI - LISTA
-// ============================================================================
-
+// EMPLOYEE API - LIST
 app.get(
     '/api/dipendenti',
     (req, res) => {
@@ -1630,7 +1420,7 @@ app.get(
         catch (error) {
 
             console.error(
-                '❌ Errore lettura dipendenti:',
+                'Errore lettura dipendenti:',
                 error
             );
 
@@ -1643,31 +1433,25 @@ app.get(
     }
 );
 
-// ============================================================================
 // HEALTH CHECK
-// ============================================================================
-
 app.get(
     '/health',
     async (req, res) => {
 
         try {
-
-            // Controlla che il NAS sia effettivamente
-            // accessibile (anche in scrittura) dal container.
-            // FIX 12: verifica anche il permesso di scrittura.
+            // Check that the NAS is actually
+            // accessible (including for writing) from the container.
+            // FIX 12: also check write permissions.
             await fs.access(
                 NAS_BASE_PATH,
                 fs.constants.R_OK | fs.constants.W_OK
             );
-
-            // Controlla anche che il DB risponda.
+            // Also check that the database responds.
             db.prepare(
                 'SELECT 1'
             ).get();
-
-            // FIX 14: l'endpoint è pubblico, quindi non espone più i
-            // percorsi interni di database e NAS.
+            // FIX 14: the endpoint is public, so it no longer exposes the
+            // internal database and NAS paths.
             return res.status(200).json({
                 status: 'ok',
 
@@ -1679,7 +1463,7 @@ app.get(
         catch (error) {
 
             console.error(
-                '❌ Health check fallito:',
+                'Health check fallito:',
                 error
             );
 
@@ -1693,24 +1477,20 @@ app.get(
     }
 );
 
-// ============================================================================
 // ERROR HANDLER
-// ============================================================================
-
 app.use(
     (error, req, res, next) => {
 
         console.error(
-            '❌ Errore non gestito:',
+            'Errore non gestito:',
             error
         );
 
         if (res.headersSent) {
             return next(error);
         }
-
-        // FIX 10: gli errori del client (es. JSON malformato, payload troppo
-        // grande) devono restituire 4xx, non 500.
+        // FIX 10: client errors (e.g. malformed JSON, oversized payloads)
+        // must return 4xx, not 500.
         const status =
             Number.isInteger(error.status) &&
             error.status >= 400 &&
@@ -1728,17 +1508,12 @@ app.use(
     }
 );
 
-// ============================================================================
-// ARRESTO GRADUALE (FIX 11)
-// ============================================================================
+// GRACEFUL SHUTDOWN (FIX 11)
 //
-// Docker invia SIGTERM allo stop/riavvio del container. Node, come PID 1,
-// senza handler non si ferma in modo pulito: una scrittura Excel in corso
-// verrebbe interrotta. Qui si smette di accettare richieste, si attende
-// il completamento della coda Excel e si chiude il database.
-//
-// ============================================================================
-
+// Docker sends SIGTERM when stopping/restarting the container. Node, as PID 1,
+// does not shut down cleanly without a handler: an ongoing Excel write
+// would be interrupted. Here, the server stops accepting requests, waits for
+// the Excel queue to finish, and closes the database.
 let server = null;
 let arrestoInCorso = false;
 
@@ -1750,12 +1525,11 @@ function arrestoGraduale(segnale) {
     arrestoInCorso = true;
 
     console.log(
-        `🛑 Segnale ${segnale} ricevuto: arresto in corso...`
+        `Segnale ${segnale} ricevuto: arresto in corso...`
     );
-
-    // Uscita forzata se l'arresto non termina entro 15 secondi.
+    // Force exit if shutdown does not finish within 15 seconds.
     setTimeout(() => {
-        console.error('❌ Arresto forzato per timeout.');
+        console.error('Arresto forzato per timeout.');
         process.exit(1);
     }, 15000).unref();
 
@@ -1763,16 +1537,16 @@ function arrestoGraduale(segnale) {
         try {
             await excelQueue;
         } catch (_) {
-            // L'errore è già stato gestito dalla richiesta.
+            // The error has already been handled by the request.
         }
 
         try {
             db.close();
         } catch (_) {
-            // Ignorato: il processo sta terminando.
+            // Ignored: the process is shutting down.
         }
 
-        console.log('👋 Server arrestato.');
+        console.log('Server stopped.');
         process.exit(0);
     };
 
@@ -1792,17 +1566,13 @@ function arrestoGraduale(segnale) {
 process.on('SIGTERM', () => arrestoGraduale('SIGTERM'));
 process.on('SIGINT', () => arrestoGraduale('SIGINT'));
 
-// ============================================================================
-// AVVIO SERVER
-// ============================================================================
-
+// SERVER STARTUP
 async function avviaServer() {
     try {
         await fs.access(DB_PATH);
-
-        // FIX 12: il NAS deve essere anche scrivibile, non solo raggiungibile
-        // (un mount in sola lettura passerebbe il controllo ma fallirebbe
-        // a ogni timbratura).
+        // FIX 12: the NAS must also be writable, not just reachable
+        // (a read-only mount would pass the check but fail
+        // on every clock-in).
         await fs.access(
             NAS_BASE_PATH,
             fs.constants.R_OK | fs.constants.W_OK
@@ -1812,24 +1582,24 @@ async function avviaServer() {
 
         console.log('');
         console.log('==============================================');
-        console.log('        CONFIGURAZIONE SERVER OK');
+        console.log('        SERVER CONFIGURATION OK');
         console.log('==============================================');
-        console.log(`🗄️ Database: ${DB_PATH}`);
-        console.log(`📁 NAS: ${NAS_BASE_PATH}`);
-        console.log(`🌍 Timezone: ${TIMEZONE}`);
-        console.log(`🔌 Porta: ${PORT}`);
+        console.log(`Database: ${DB_PATH}`);
+        console.log(`NAS: ${NAS_BASE_PATH}`);
+        console.log(`Timezone: ${TIMEZONE}`);
+        console.log(`Port: ${PORT}`);
         console.log(
-            `⏳ Intervallo minimo tra timbrature: ${MIN_INTERVALLO_TIMBRATURE_SEC}s`
+            `Minimum interval between clock-ins: ${MIN_INTERVALLO_TIMBRATURE_SEC}s`
         );
         console.log('----------------------------------------------');
-        console.log('✓ Database presente e valido');
-        console.log('✓ NAS raggiungibile e scrivibile');
+        console.log('✓ Database found and valid');
+        console.log('✓ NAS reachable and writable');
 
         if (API_KEY) {
-            console.log('✓ Autenticazione API attiva (x-api-key)');
+            console.log('✓ API authentication enabled (x-api-key)');
         } else {
             console.warn(
-                '⚠️ API_KEY non impostata: le rotte /api/* sono PUBBLICHE.'
+                'API_KEY non impostata: le rotte /api/* sono PUBBLICHE.'
             );
         }
 
@@ -1840,7 +1610,7 @@ async function avviaServer() {
             '0.0.0.0',
             () => {
                 console.log(
-                    `🚀 Server avviato sulla porta ${PORT}`
+                    `Server started on port ${PORT}`
                 );
             }
         );
