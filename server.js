@@ -237,7 +237,7 @@ function ottieniNomeDipendente(uid) {
     }
 
     console.warn(
-        'UID non presente nel database: [${uid}]`
+        `UID non presente nel database: [${uid}]`
     );
 
     return `Sconosciuto (${uid})`;
@@ -1011,7 +1011,7 @@ async function gestisciPresenze(
         else {
 
             console.log(
-                'Updating row ${targetRow.number}`
+                `Updating row ${targetRow.number}`
             );
             // FIX 3: DUPLICATE SCAN PREVENTION
             //
